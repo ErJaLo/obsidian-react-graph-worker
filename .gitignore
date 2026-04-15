@@ -1,0 +1,5 @@
+scripts/seed-users.local.json
+scripts/seed-acl.local.json
+wrangler.toml.local
+.wrangler/
+node_modules/
