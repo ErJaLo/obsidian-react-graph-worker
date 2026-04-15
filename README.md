@@ -1,0 +1,1 @@
+# obsidian-react-graph-worker
