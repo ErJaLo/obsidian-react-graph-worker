@@ -29,6 +29,56 @@ function getWorkerBaseUrl(request) {
   return new URL(request.url).origin;
 }
 
+const CANVAS_STATE_KV_PREFIX = "canvas-state:";
+
+function getCanvasStateKey(campaignId) {
+  return `${CANVAS_STATE_KV_PREFIX}${campaignId}`;
+}
+
+function isFiniteNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function normalizeCanvasState(input) {
+  if (!input || typeof input !== 'object') return null;
+
+  const positions = {};
+  if (input.positions && typeof input.positions === 'object') {
+    for (const [nodeId, value] of Object.entries(input.positions)) {
+      if (typeof nodeId !== 'string' || !nodeId.trim()) continue;
+      if (!value || !isFiniteNumber(value.x) || !isFiniteNumber(value.y)) continue;
+      positions[nodeId] = { x: value.x, y: value.y };
+    }
+  }
+
+  const viewport = input.viewport && typeof input.viewport === 'object'
+    ? {
+        ...(isFiniteNumber(input.viewport.x) ? { x: input.viewport.x } : {}),
+        ...(isFiniteNumber(input.viewport.y) ? { y: input.viewport.y } : {}),
+        ...(isFiniteNumber(input.viewport.zoom) ? { zoom: input.viewport.zoom } : {}),
+      }
+    : null;
+
+  return {
+    positions,
+    ...(viewport && Object.keys(viewport).length > 0 ? { viewport } : {}),
+    updatedAt: Date.now(),
+  };
+}
+
+async function readCanvasState(env, campaignId) {
+  const raw = await env.APP_KV.get(getCanvasStateKey(campaignId));
+  if (!raw) return { positions: {}, viewport: null, updatedAt: null };
+
+  try {
+    const parsed = JSON.parse(raw);
+    const normalized = normalizeCanvasState(parsed);
+    return normalized || { positions: {}, viewport: null, updatedAt: null };
+  } catch {
+    return { positions: {}, viewport: null, updatedAt: null };
+  }
+}
+
 function toProxyPath(pathname, baseUrl) {
   const normalized = pathname
     .replace(/\\/g, '/')
@@ -385,6 +435,60 @@ async function handleSave(request, env) {
   return json({ ok: true, commit: result.commit.sha });
 }
 
+async function handleGetCanvasState(request, env) {
+  const session = await getSession(env, request.headers.get('Authorization'));
+  if (!session) return err('Unauthorized', 401);
+
+  const url = new URL(request.url);
+  const campaignId = url.searchParams.get('campaignId');
+  if (!campaignId) return err('Missing campaignId');
+
+  const acl = await getCampaignAcl(env);
+  const perms = acl[campaignId]?.[session.username] ?? [];
+  if (perms.length === 0) return err('Forbidden', 403);
+
+  const canvasState = await readCanvasState(env, campaignId);
+  return json({ campaignId, canvasState });
+}
+
+async function handleSaveCanvasState(request, env) {
+  const session = await getSession(env, request.headers.get('Authorization'));
+  if (!session) return err('Unauthorized', 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return err('Invalid JSON body');
+  }
+
+  const { campaignId, canvasState } = body;
+  if (!campaignId || !canvasState) return err('Missing campaignId or canvasState');
+
+  const acl = await getCampaignAcl(env);
+  const perms = acl[campaignId]?.[session.username] ?? [];
+  if (!perms.includes('write')) return err('Write access denied', 403);
+
+  const normalizedIncoming = normalizeCanvasState(canvasState);
+  if (!normalizedIncoming) return err('Invalid canvasState payload');
+
+  const current = await readCanvasState(env, campaignId);
+  const merged = {
+    ...current,
+    positions: {
+      ...(current?.positions || {}),
+      ...(normalizedIncoming.positions || {}),
+    },
+    ...(normalizedIncoming.viewport ? { viewport: normalizedIncoming.viewport } : {}),
+    updatedAt: Date.now(),
+    savedBy: session.username,
+  };
+
+  await env.APP_KV.put(getCanvasStateKey(campaignId), JSON.stringify(merged));
+
+  return json({ ok: true, campaignId, canvasState: merged });
+}
+
 // ── Main Router ───────────────────────────────────────────────────────────────
 
 export default {
@@ -414,6 +518,14 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/save") {
       return handleSave(request, env);
+    }
+
+    if (request.method === 'GET' && url.pathname === '/canvas-state') {
+      return handleGetCanvasState(request, env);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/canvas-state') {
+      return handleSaveCanvasState(request, env);
     }
 
     return err("Not found", 404);
