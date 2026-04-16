@@ -1,6 +1,6 @@
 # obsidian-react-graph-worker
 
-Cloudflare Worker backend for `obsidian-react-graph`. Handles authentication, campaign access control, and GitHub commits. Users never touch GitHub directly — all writes go through this Worker using a bot token.
+Cloudflare Worker backend for obsidian-react-graph. Handles authentication, campaign access control, private GitHub reads, and GitHub commits. The React app never talks to GitHub directly; all reads and writes go through this Worker.
 
 ---
 
@@ -11,13 +11,15 @@ React App (Cloudflare Pages)
     │
     │  POST /login
     │  GET  /projects
+    │  GET  /projects/:campaignId/auth/:token/*
     │  POST /save
     ▼
 Cloudflare Worker  ◄──── KV (passwords, ACL, sessions)
     │
-    │  GitHub Contents API (bot token)
-    ▼
-GitHub Repo (campaign JSON files)
+    ├── GitHub Contents API (bot token)
+    └── private file proxy for graph JSON + assets
+        ▼
+      GitHub private repo (campaign JSON files)
 ```
 
 ---
@@ -39,15 +41,15 @@ obsidian-react-graph-worker/
 
 ## KV Storage
 
-KV namespace binding: `APP_KV`
+KV namespace binding: APP_KV
 
-| Key         | Value shape                                              | Description                        |
-|-------------|----------------------------------------------------------|------------------------------------|
-| `passwords` | `{ username: "pbkdf2:..." }`                             | PBKDF2-hashed passwords per user   |
-| `acl`       | `{ campaignId: { username: ["read","write"] } }`         | Per-campaign permissions per user  |
-| `sessions`  | `{ token: { username, expiresAt } }`                     | Active session tokens              |
+| Key         | Value shape                                  | Description                      |
+|-------------|----------------------------------------------|----------------------------------|
+| `passwords` | `{ username: "pbkdf2:..." }`               | PBKDF2-hashed passwords per user |
+| `acl`       | `{ campaignId: { username: ["read","write"] } }` | Per-campaign permissions per user |
+| `sessions`  | `{ token: { username, expiresAt } }`         | Active session tokens            |
 
-Passwords are hashed with PBKDF2 (SHA-256, 100k iterations) using the Web Crypto API — compatible with the Workers runtime (no Node.js bcrypt).
+Passwords are hashed with PBKDF2 (SHA-256, 100k iterations) using the Web Crypto API, compatible with the Workers runtime.
 
 Hash format: `pbkdf2:100000:<salt_hex>:<hash_hex>`
 
@@ -78,11 +80,22 @@ Authorization: Bearer <token>
     {
       "id": "ravenfall-campaign",
       "title": "Ravenfall: Crystal Heist",
-      "permissions": ["read", "write"]
+      "permissions": ["read", "write"],
+      "graphFile": "https://worker.example/projects/ravenfall-campaign/auth/<token>/obsidian-graph.json"
     }
   ]
 }
 ```
+
+The Worker rewrites `graphFile`, `metadataFile`, and `folder` so the front end uses authenticated Worker URLs instead of raw GitHub URLs.
+
+### `GET /projects/:campaignId/auth/:token/*`
+Private file proxy used by the front end for campaign JSON files and relative assets.
+
+Example:
+`/projects/ravenfall-campaign/auth/<token>/obsidian-graph.json`
+
+The browser can fetch these URLs directly because access is enforced by the Worker.
 
 ### `POST /save`
 ```
@@ -103,15 +116,16 @@ Authorization: Bearer <token>
 
 ## Environment Variables & Secrets
 
-Set these in Cloudflare Worker settings (or `wrangler secret put`):
+Set these in Cloudflare Worker settings or with Wrangler:
 
-| Name             | Type   | Description                                     |
-|------------------|--------|-------------------------------------------------|
-| `GITHUB_TOKEN`   | Secret | Bot token with write access to the target repo  |
-| `GITHUB_OWNER`   | Var    | GitHub user or org (e.g. `ErJaLo`)             |
-| `GITHUB_REPO`    | Var    | Repo name (e.g. `Roleplay-Library`)             |
-| `GITHUB_BRANCH`  | Var    | Target branch (e.g. `main`)                     |
-| `GRAPHS_PATH`    | Var    | Path to campaign folder (e.g. `ravenfall-campaign`) |
+| Name            | Type   | Description                                |
+|-----------------|--------|--------------------------------------------|
+| `GITHUB_TOKEN`  | Secret | Bot token with write access to the target repo |
+| `GITHUB_OWNER`  | Var    | GitHub user or org, e.g. `ErJaLo`          |
+| `GITHUB_REPO`   | Var    | Repo name, e.g. `Roleplay-Library`         |
+| `GITHUB_BRANCH` | Var    | Target branch, e.g. `main`                 |
+
+`GRAPHS_PATH` is no longer used in the current flow.
 
 ---
 
@@ -125,21 +139,9 @@ wrangler login
 wrangler whoami  # verify
 ```
 
-### 2. Create KV namespaces
+### 2. Verify KV bindings
 
-```bash
-wrangler kv namespace create APP_KV
-wrangler kv namespace create APP_KV --preview
-```
-
-Paste the returned IDs into `wrangler.toml`:
-
-```toml
-[[kv_namespaces]]
-binding = "APP_KV"
-id = "PRODUCTION_ID"
-preview_id = "PREVIEW_ID"
-```
+`wrangler.toml` already binds APP_KV. If you need to change it, update the production and preview IDs in that file.
 
 ### 3. Seed KV (users + ACL)
 
@@ -188,11 +190,17 @@ wrangler kv key get --remote --preview false --binding=APP_KV "passwords"
 wrangler kv key get --remote --preview false --binding=APP_KV "acl"
 ```
 
-### 4. Set secrets
+### 4. Set secrets and vars
 
 ```bash
 wrangler secret put GITHUB_TOKEN
 ```
+
+Set these variables in Cloudflare Worker settings or via Wrangler environment config:
+
+- `GITHUB_OWNER`
+- `GITHUB_REPO`
+- `GITHUB_BRANCH`
 
 ### 5. Deploy
 
@@ -226,6 +234,8 @@ wrangler kv key put --remote --preview false --binding=APP_KV "acl" '<updated_js
 ## Notes
 
 - The GitHub bot token is stored only in the Worker — never in the React app or repo.
+- Reads are proxied through the Worker so the GitHub repo can stay private.
+- The front end receives Worker URLs for campaign files and images, not GitHub raw URLs.
 - All GitHub writes include the acting username in the commit message: `Update ravenfall-campaign (by alice)`.
-- The GitHub Contents API requires the current file `sha` on updates — the Worker fetches it before each write.
+- The GitHub Contents API requires the current file sha on updates — the Worker fetches it before each write.
 - Sessions are stored in KV with an expiry timestamp. Expired tokens are rejected on each request.
