@@ -17,6 +17,196 @@ function err(message, status = 400) {
   return json({ error: message }, status);
 }
 
+function getGithubConfig(env) {
+  const owner = env.GITHUB_OWNER || null;
+  const repo = env.GITHUB_REPO || null;
+  const branch = env.GITHUB_BRANCH || null;
+
+  return { owner, repo, branch };
+}
+
+function getWorkerBaseUrl(request) {
+  return new URL(request.url).origin;
+}
+
+function toProxyPath(pathname, baseUrl) {
+  const normalized = pathname
+    .replace(/\\/g, '/')
+    .replace(/^\.?\/?/, '')
+    .replace(/^\/+/, '');
+
+  const proxyPath = `${baseUrl}/projects/${normalized}`;
+
+  if (pathname.endsWith('/')) {
+    return `${proxyPath}/`;
+  }
+
+  return proxyPath;
+}
+
+function rewriteGraphDescriptor(graph, baseUrl, authToken) {
+  const rewrite = (value, keepDirectorySlash = false) => {
+    if (typeof value !== 'string' || value.trim().length === 0) {
+      return value;
+    }
+
+    const trimmed = value.trim();
+
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+      return trimmed;
+    }
+
+    const proxied = new URL(toProxyPath(trimmed, baseUrl));
+
+    if (authToken) {
+      const match = proxied.pathname.match(/^\/projects\/([^/]+)(?:\/(.*))?$/);
+      if (match) {
+        const campaignId = match[1];
+        const rest = match[2] || '';
+        proxied.pathname = `/projects/${campaignId}/auth/${authToken}/${rest}`.replace(/\/+/g, '/');
+      }
+    }
+
+    if (keepDirectorySlash && !proxied.pathname.endsWith('/')) {
+      proxied.pathname += '/';
+    }
+
+    return proxied.toString();
+  };
+
+  return {
+    ...graph,
+    folder: rewrite(graph.folder, true),
+    metadataFile: rewrite(graph.metadataFile),
+    graphFile: rewrite(graph.graphFile),
+  };
+}
+
+function inferContentType(filePath) {
+  const lower = filePath.toLowerCase();
+
+  if (lower.endsWith('.json')) return 'application/json; charset=utf-8';
+  if (lower.endsWith('.svg')) return 'image/svg+xml; charset=utf-8';
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.bmp')) return 'image/bmp';
+  if (lower.endsWith('.ico')) return 'image/x-icon';
+  if (lower.endsWith('.txt') || lower.endsWith('.md') || lower.endsWith('.csv') || lower.endsWith('.yaml') || lower.endsWith('.yml')) {
+    return 'text/plain; charset=utf-8';
+  }
+
+  return 'application/octet-stream';
+}
+
+function decodeBase64Content(content) {
+  const binary = atob(content.replace(/\n/g, ''));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function loadCampaignIndex(env, owner, repo, branch) {
+  const indexRawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/index.json`;
+  const rawRes = await fetch(indexRawUrl);
+  if (rawRes.ok) {
+    return { index: await rawRes.json(), source: 'raw', rawStatus: rawRes.status };
+  }
+
+  const indexApiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/index.json?ref=${encodeURIComponent(branch)}`;
+  const indexRes = await fetch(indexApiUrl, {
+    headers: {
+      ...(env.GITHUB_TOKEN ? { Authorization: `Bearer ${env.GITHUB_TOKEN}` } : {}),
+      "User-Agent": "obsidian-worker",
+    },
+  });
+
+  if (!indexRes.ok) {
+    return { index: null, source: 'api', rawStatus: rawRes.status, apiStatus: indexRes.status };
+  }
+
+  const indexFile = await indexRes.json();
+  return {
+    index: JSON.parse(decodeURIComponent(escape(atob(indexFile.content)))),
+    source: 'api',
+    rawStatus: rawRes.status,
+    apiStatus: indexRes.status,
+  };
+}
+
+async function getCampaignAcl(env) {
+  const aclRaw = await env.APP_KV.get("acl");
+  return aclRaw ? JSON.parse(aclRaw) : {};
+}
+
+async function getSessionByToken(env, token) {
+  if (!token) return null;
+
+  const raw = await env.APP_KV.get("sessions");
+  if (!raw) return null;
+
+  const sessions = JSON.parse(raw);
+  const session = sessions[token];
+  if (!session) return null;
+  if (Date.now() > session.expiresAt) return null;
+
+  return { ...session, token };
+}
+
+async function handleProjectFile(request, env, campaignId, authToken, fileSegments) {
+  const session = authToken
+    ? await getSessionByToken(env, authToken)
+    : await getSession(env, request.headers.get("Authorization"));
+  if (!session) return err("Unauthorized", 401);
+
+  const acl = await getCampaignAcl(env);
+  const perms = acl[campaignId]?.[session.username] ?? [];
+  if (perms.length === 0) return err("Forbidden", 403);
+
+  const relativePath = fileSegments.join("/");
+  if (!relativePath || relativePath.includes("..")) {
+    return err("Invalid file path", 400);
+  }
+
+  const owner = env.GITHUB_OWNER || await env.APP_KV.get("config:github_owner");
+  const repo = env.GITHUB_REPO || await env.APP_KV.get("config:github_repo");
+  const branch = env.GITHUB_BRANCH || await env.APP_KV.get("config:github_branch");
+  if (!owner || !repo || !branch) {
+    return err("Server misconfigured: missing GITHUB_OWNER/REPO/BRANCH", 500);
+  }
+
+  const filePath = `${campaignId}/${relativePath}`;
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${filePath.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(branch)}`;
+  const res = await fetch(apiUrl, {
+    headers: {
+      ...(env.GITHUB_TOKEN ? { Authorization: `Bearer ${env.GITHUB_TOKEN}` } : {}),
+      "User-Agent": "obsidian-worker",
+    },
+  });
+
+  if (!res.ok) {
+    return err(`Could not load ${relativePath}`, res.status === 404 ? 404 : 502);
+  }
+
+  const fileInfo = await res.json();
+  if (fileInfo?.encoding !== 'base64' || typeof fileInfo.content !== 'string') {
+    return err(`Unsupported response for ${relativePath}`, 502);
+  }
+
+  const body = decodeBase64Content(fileInfo.content);
+  return new Response(body, {
+    status: 200,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": inferContentType(relativePath),
+      "Cache-Control": "private, max-age=60",
+    },
+  });
+}
+
 async function verifyPassword(plain, stored) {
   // stored format: "pbkdf2:<iterations>:<salt_hex>:<hash_hex>"
   const [, iterations, saltHex, hashHex] = stored.split(":");
@@ -48,7 +238,7 @@ async function getSession(env, authHeader) {
   const session = sessions[token];
   if (!session) return null;
   if (Date.now() > session.expiresAt) return null;
-  return session; // { username, expiresAt }
+  return { ...session, token }; // { username, expiresAt, token }
 }
 
 // ── Route Handlers ────────────────────────────────────────────────────────────
@@ -98,35 +288,22 @@ async function handleProjects(request, env) {
     return err("Server misconfigured: missing GITHUB_OWNER/REPO/BRANCH", 500);
   }
 
-  let index;
-  const indexRawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/index.json`;
-  const rawRes = await fetch(indexRawUrl);
-  if (rawRes.ok) {
-    index = await rawRes.json();
-  } else {
-    const indexApiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/index.json?ref=${branch}`;
-    const indexRes = await fetch(indexApiUrl, {
-      headers: {
-        ...(env.GITHUB_TOKEN ? { Authorization: `Bearer ${env.GITHUB_TOKEN}` } : {}),
-        "User-Agent": "obsidian-worker",
-      },
-    });
-    if (!indexRes.ok) {
-      return err(`Could not load campaign index (raw:${rawRes.status}, api:${indexRes.status})`, 502);
-    }
-    const indexFile = await indexRes.json();
-    index = JSON.parse(decodeURIComponent(escape(atob(indexFile.content))));
+  const indexResult = await loadCampaignIndex(env, owner, repo, branch);
+  if (!indexResult.index) {
+    return err(`Could not load campaign index (raw:${indexResult.rawStatus}, api:${indexResult.apiStatus ?? 'n/a'})`, 502);
   }
 
+  const index = indexResult.index;
+  const workerBaseUrl = getWorkerBaseUrl(request);
+
   // Load ACL
-  const aclRaw = await env.APP_KV.get("acl");
-  const acl = aclRaw ? JSON.parse(aclRaw) : {};
+  const acl = await getCampaignAcl(env);
 
   // Filter to campaigns this user can access
   const graphs = index.graphs
     .filter(g => acl[g.id]?.[session.username]?.length > 0)
     .map(g => ({
-      ...g,
+      ...rewriteGraphDescriptor(g, workerBaseUrl, session.token),
       permissions: acl[g.id][session.username],
     }));
 
@@ -164,7 +341,7 @@ async function handleSave(request, env) {
   const apiBase = `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`;
 
   // Get current file sha (required by GitHub API for updates)
-  const getRes = await fetch(`${apiBase}?ref=${env.GITHUB_BRANCH}`, {
+  const getRes = await fetch(`${apiBase}?ref=${encodeURIComponent(branch)}`, {
     headers: {
       Authorization: `Bearer ${env.GITHUB_TOKEN}`,
       "User-Agent": "obsidian-worker",
@@ -194,7 +371,7 @@ async function handleSave(request, env) {
     body: JSON.stringify({
       message: `Update ${campaignId} (by ${session.username})`,
       content,
-      branch: env.GITHUB_BRANCH,
+      branch,
       ...(sha ? { sha } : {}),
     }),
   });
@@ -225,6 +402,14 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/projects") {
       return handleProjects(request, env);
+    }
+
+    const projectFileMatch = url.pathname.match(/^\/projects\/([^/]+)\/auth\/([^/]+)\/(.+)$/);
+    if (request.method === "GET" && projectFileMatch) {
+      const campaignId = decodeURIComponent(projectFileMatch[1]);
+      const authToken = decodeURIComponent(projectFileMatch[2]);
+      const fileSegments = projectFileMatch[3].split("/").map((segment) => decodeURIComponent(segment));
+      return handleProjectFile(request, env, campaignId, authToken, fileSegments);
     }
 
     if (request.method === "POST" && url.pathname === "/save") {
