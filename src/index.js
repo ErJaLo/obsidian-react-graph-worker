@@ -388,36 +388,41 @@ async function handleSave(request, env) {
     return err("Server misconfigured: missing GITHUB_OWNER/REPO/BRANCH", 500);
   }
   const filePath = `${campaignId}/obsidian-graph.json`;
-  const apiBase = `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`;
+  const apiFilePath = filePath.split('/').map(encodeURIComponent).join('/');
+  const apiBase = `https://api.github.com/repos/${owner}/${repo}/contents/${apiFilePath}`;
 
-  // Get current file sha (required by GitHub API for updates)
-  const getRes = await fetch(`${apiBase}?ref=${encodeURIComponent(branch)}`, {
-    headers: {
-      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-      "User-Agent": "obsidian-worker",
-    },
-  });
+  const githubHeaders = {
+    Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+    "User-Agent": "obsidian-worker",
+    "Content-Type": "application/json",
+  };
 
-  let sha;
-  if (getRes.ok) {
-    const fileInfo = await getRes.json();
-    sha = fileInfo.sha;
-  } else if (getRes.status !== 404) {
-    return err("Failed to read file from GitHub", 502);
-  }
-  // 404 = file doesn't exist yet, sha stays undefined (first commit)
+  const getCurrentSha = async () => {
+    const getRes = await fetch(`${apiBase}?ref=${encodeURIComponent(branch)}`, {
+      headers: {
+        Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+        "User-Agent": "obsidian-worker",
+      },
+    });
+
+    if (getRes.ok) {
+      const fileInfo = await getRes.json();
+      return { sha: fileInfo.sha, notFound: false };
+    }
+
+    if (getRes.status === 404) {
+      return { sha: undefined, notFound: true };
+    }
+
+    return { sha: null, notFound: false };
+  };
 
   // Encode content as base64
   const content = btoa(unescape(encodeURIComponent(JSON.stringify(graphData, null, 2))));
 
-  // Commit
-  const putRes = await fetch(apiBase, {
+  const commitGraph = async (sha) => fetch(apiBase, {
     method: "PUT",
-    headers: {
-      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-      "User-Agent": "obsidian-worker",
-      "Content-Type": "application/json",
-    },
+    headers: githubHeaders,
     body: JSON.stringify({
       message: `Update ${campaignId} (by ${session.username})`,
       content,
@@ -426,9 +431,44 @@ async function handleSave(request, env) {
     }),
   });
 
+  const firstShaState = await getCurrentSha();
+  if (firstShaState.sha === null) {
+    return err("Failed to read file from GitHub", 502);
+  }
+
+  let putRes = await commitGraph(firstShaState.sha);
+
   if (!putRes.ok) {
-    const detail = await putRes.json();
-    return err(`GitHub commit failed: ${detail.message}`, 502);
+    let detail;
+    try {
+      detail = await putRes.json();
+    } catch {
+      detail = null;
+    }
+
+    const message = detail?.message || "GitHub commit failed";
+    const isShaConflict = putRes.status === 409 || /expected|sha/i.test(message);
+
+    if (isShaConflict) {
+      const retryShaState = await getCurrentSha();
+      if (retryShaState.sha === null) {
+        return err("Failed to refresh file SHA from GitHub", 502);
+      }
+
+      putRes = await commitGraph(retryShaState.sha);
+
+      if (!putRes.ok) {
+        let retryDetail;
+        try {
+          retryDetail = await putRes.json();
+        } catch {
+          retryDetail = null;
+        }
+        return err(`GitHub commit failed: ${retryDetail?.message || message}`, 502);
+      }
+    } else {
+      return err(`GitHub commit failed: ${message}`, 502);
+    }
   }
 
   const result = await putRes.json();
