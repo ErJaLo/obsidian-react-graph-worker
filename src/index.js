@@ -29,10 +29,83 @@ function getWorkerBaseUrl(request) {
   return new URL(request.url).origin;
 }
 
+function isGithubWebhookEnabled(env) {
+  const value = String(env.ENABLE_GITHUB_WEBHOOKS ?? '').trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+}
+
+function bytesToHex(bytes) {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function timingSafeHexEqual(leftHex, rightHex) {
+  if (typeof leftHex !== 'string' || typeof rightHex !== 'string') return false;
+  if (leftHex.length !== rightHex.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < leftHex.length; i += 1) {
+    mismatch |= leftHex.charCodeAt(i) ^ rightHex.charCodeAt(i);
+  }
+  return mismatch === 0;
+}
+
+async function computeHmacSha256Hex(secret, payloadText) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(payloadText));
+  return bytesToHex(new Uint8Array(signature));
+}
+
+async function verifyGithubWebhookSignature(payloadText, signatureHeader, secret) {
+  if (!signatureHeader || typeof signatureHeader !== 'string') return false;
+  if (!signatureHeader.startsWith('sha256=')) return false;
+  const receivedHex = signatureHeader.slice('sha256='.length).trim().toLowerCase();
+  if (!receivedHex) return false;
+  const expectedHex = await computeHmacSha256Hex(secret, payloadText);
+  return timingSafeHexEqual(receivedHex, expectedHex);
+}
+
 const CANVAS_STATE_KV_PREFIX = "canvas-state:";
+const WEBHOOK_DELIVERY_KV_PREFIX = 'webhook-delivery:';
+const WEBHOOK_DELIVERY_TTL_SECONDS = 60 * 60 * 24;
+const EDITOR_PRESENCE_KV_PREFIX = 'editor-presence:';
+const EDITOR_PRESENCE_TTL_SECONDS = 90;
+const GRAPH_VERSION_KV_PREFIX = 'graph-version:';
 
 function getCanvasStateKey(campaignId) {
   return `${CANVAS_STATE_KV_PREFIX}${campaignId}`;
+}
+
+function getWebhookDeliveryKey(deliveryId) {
+  return `${WEBHOOK_DELIVERY_KV_PREFIX}${deliveryId}`;
+}
+
+function getEditorPresenceKey(campaignId, username) {
+  return `${EDITOR_PRESENCE_KV_PREFIX}${campaignId}`;
+}
+
+function getGraphVersionKey(campaignId) {
+  return `${GRAPH_VERSION_KV_PREFIX}${campaignId}`;
+}
+
+async function readGraphVersion(env, campaignId) {
+  const raw = await env.APP_KV.get(getGraphVersionKey(campaignId));
+  if (!raw) return { updatedAt: 0, updatedBy: null, commit: null };
+  try {
+    const parsed = JSON.parse(raw);
+    return {
+      updatedAt: isFiniteNumber(parsed?.updatedAt) ? parsed.updatedAt : 0,
+      updatedBy: typeof parsed?.updatedBy === 'string' ? parsed.updatedBy : null,
+      commit: typeof parsed?.commit === 'string' ? parsed.commit : null,
+    };
+  } catch {
+    return { updatedAt: 0, updatedBy: null, commit: null };
+  }
 }
 
 function isFiniteNumber(value) {
@@ -64,6 +137,26 @@ function normalizeCanvasState(input) {
     ...(viewport && Object.keys(viewport).length > 0 ? { viewport } : {}),
     updatedAt: Date.now(),
   };
+}
+
+function getCanvasStateSignature(canvasState) {
+  if (!canvasState || typeof canvasState !== 'object') return '';
+  const positions = canvasState.positions && typeof canvasState.positions === 'object' ? canvasState.positions : {};
+  const viewport = canvasState.viewport && typeof canvasState.viewport === 'object' ? canvasState.viewport : null;
+
+  const positionEntries = Object.entries(positions)
+    .filter(([, value]) => isFiniteNumber(value?.x) && isFiniteNumber(value?.y))
+    .sort(([leftId], [rightId]) => leftId.localeCompare(rightId))
+    .map(([nodeId, value]) => [nodeId, Number(value.x.toFixed(3)), Number(value.y.toFixed(3))]);
+
+  return JSON.stringify({
+    positions: positionEntries,
+    viewport: viewport ? {
+      ...(isFiniteNumber(viewport.x) ? { x: Number(viewport.x.toFixed(3)) } : {}),
+      ...(isFiniteNumber(viewport.y) ? { y: Number(viewport.y.toFixed(3)) } : {}),
+      ...(isFiniteNumber(viewport.zoom) ? { zoom: Number(viewport.zoom.toFixed(3)) } : {}),
+    } : null,
+  });
 }
 
 async function readCanvasState(env, campaignId) {
@@ -472,6 +565,14 @@ async function handleSave(request, env) {
   }
 
   const result = await putRes.json();
+  await env.APP_KV.put(
+    getGraphVersionKey(campaignId),
+    JSON.stringify({
+      updatedAt: Date.now(),
+      updatedBy: session.username,
+      commit: result?.commit?.sha || null,
+    }),
+  );
   return json({ ok: true, commit: result.commit.sha });
 }
 
@@ -513,6 +614,10 @@ async function handleSaveCanvasState(request, env) {
   if (!normalizedIncoming) return err('Invalid canvasState payload');
 
   const current = await readCanvasState(env, campaignId);
+  if (getCanvasStateSignature(current) === getCanvasStateSignature(normalizedIncoming)) {
+    return json({ ok: true, campaignId, canvasState: current, skipped: true });
+  }
+
   const merged = {
     ...current,
     positions: {
@@ -529,6 +634,200 @@ async function handleSaveCanvasState(request, env) {
   return json({ ok: true, campaignId, canvasState: merged });
 }
 
+async function handleGetEditorPresence(request, env) {
+  const session = await getSession(env, request.headers.get('Authorization'));
+  if (!session) return err('Unauthorized', 401);
+
+  const url = new URL(request.url);
+  const campaignId = url.searchParams.get('campaignId');
+  if (!campaignId) return err('Missing campaignId');
+
+  const acl = await getCampaignAcl(env);
+  const perms = acl[campaignId]?.[session.username] ?? [];
+  if (perms.length === 0) return err('Forbidden', 403);
+
+  const raw = await env.APP_KV.get(getEditorPresenceKey(campaignId));
+  let parsed = null;
+  try {
+    parsed = raw ? JSON.parse(raw) : null;
+  } catch {
+    parsed = null;
+  }
+
+  const activeEditors = [];
+  const now = Date.now();
+  if (parsed && typeof parsed === 'object' && parsed.users && typeof parsed.users === 'object') {
+    for (const [username, meta] of Object.entries(parsed.users)) {
+      if (!username || username === session.username) continue;
+      if (!meta || !isFiniteNumber(meta.updatedAt)) continue;
+      if ((now - meta.updatedAt) > EDITOR_PRESENCE_TTL_SECONDS * 1000) continue;
+      activeEditors.push(username);
+    }
+  }
+
+  const graphVersion = await readGraphVersion(env, campaignId);
+
+  return json({
+    campaignId,
+    activeEditors: [...new Set(activeEditors)],
+    me: session.username,
+    graphUpdatedAt: graphVersion.updatedAt,
+    graphUpdatedBy: graphVersion.updatedBy,
+    graphCommit: graphVersion.commit,
+  });
+}
+
+async function handleSaveEditorPresence(request, env) {
+  const session = await getSession(env, request.headers.get('Authorization'));
+  if (!session) return err('Unauthorized', 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return err('Invalid JSON body');
+  }
+
+  const { campaignId } = body || {};
+  if (!campaignId) return err('Missing campaignId');
+
+  const acl = await getCampaignAcl(env);
+  const perms = acl[campaignId]?.[session.username] ?? [];
+  if (perms.length === 0) return err('Forbidden', 403);
+
+  const key = getEditorPresenceKey(campaignId, session.username);
+  let current = { campaignId, users: {} };
+  const raw = await env.APP_KV.get(key);
+  try {
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && typeof parsed === 'object' && parsed.users && typeof parsed.users === 'object') {
+      current = {
+        campaignId: parsed.campaignId || campaignId,
+        users: parsed.users,
+      };
+    }
+  } catch {
+    current = { campaignId, users: {} };
+  }
+
+  current.users[session.username] = { updatedAt: Date.now() };
+
+  await env.APP_KV.put(
+    key,
+    JSON.stringify(current),
+    { expirationTtl: EDITOR_PRESENCE_TTL_SECONDS },
+  );
+
+  const activeEditors = [];
+  const now = Date.now();
+  for (const [username, meta] of Object.entries(current.users)) {
+    if (!username || username === session.username) continue;
+    if (!meta || !isFiniteNumber(meta.updatedAt)) continue;
+    if ((now - meta.updatedAt) > EDITOR_PRESENCE_TTL_SECONDS * 1000) continue;
+    activeEditors.push(username);
+  }
+
+  const graphVersion = await readGraphVersion(env, campaignId);
+
+  return json({
+    ok: true,
+    campaignId,
+    username: session.username,
+    activeEditors: [...new Set(activeEditors)],
+    graphUpdatedAt: graphVersion.updatedAt,
+    graphUpdatedBy: graphVersion.updatedBy,
+    graphCommit: graphVersion.commit,
+  });
+}
+
+async function handleGithubWebhook(request, env) {
+  if (!isGithubWebhookEnabled(env)) {
+    return err('GitHub webhooks are disabled', 403);
+  }
+
+  const webhookSecret = String(env.GITHUB_WEBHOOK_SECRET ?? '').trim();
+  if (!webhookSecret) {
+    return err('Server misconfigured: missing GITHUB_WEBHOOK_SECRET', 500);
+  }
+
+  const signatureHeader = request.headers.get('X-Hub-Signature-256');
+  const eventName = request.headers.get('X-GitHub-Event') || 'unknown';
+  const deliveryId = request.headers.get('X-GitHub-Delivery') || null;
+
+  if (!deliveryId) {
+    return err('Missing X-GitHub-Delivery header', 400);
+  }
+
+  const deliveryKey = getWebhookDeliveryKey(deliveryId);
+  const alreadyProcessed = await env.APP_KV.get(deliveryKey);
+  if (alreadyProcessed) {
+    return json({
+      ok: true,
+      event: eventName,
+      deliveryId,
+      processed: false,
+      duplicate: true,
+      reason: 'duplicate delivery id',
+    });
+  }
+
+  const payloadText = await request.text();
+
+  const isValidSignature = await verifyGithubWebhookSignature(
+    payloadText,
+    signatureHeader,
+    webhookSecret,
+  );
+
+  if (!isValidSignature) {
+    return err('Invalid webhook signature', 401);
+  }
+
+  let payload;
+  try {
+    payload = payloadText ? JSON.parse(payloadText) : {};
+  } catch {
+    return err('Invalid webhook JSON payload', 400);
+  }
+
+  if (eventName === 'ping') {
+    await env.APP_KV.put(deliveryKey, '1', { expirationTtl: WEBHOOK_DELIVERY_TTL_SECONDS });
+    return json({ ok: true, event: eventName, deliveryId, processed: false, reason: 'ping' });
+  }
+
+  if (eventName === 'push') {
+    const expectedBranch = env.GITHUB_BRANCH || null;
+    const pushedRef = typeof payload?.ref === 'string' ? payload.ref : null;
+    const expectedRef = expectedBranch ? `refs/heads/${expectedBranch}` : null;
+
+    if (expectedRef && pushedRef && pushedRef !== expectedRef) {
+      await env.APP_KV.put(deliveryKey, '1', { expirationTtl: WEBHOOK_DELIVERY_TTL_SECONDS });
+      return json({
+        ok: true,
+        event: eventName,
+        deliveryId,
+        processed: false,
+        reason: `ignored ref ${pushedRef}`,
+      });
+    }
+
+    await env.APP_KV.put(deliveryKey, '1', { expirationTtl: WEBHOOK_DELIVERY_TTL_SECONDS });
+
+    return json({
+      ok: true,
+      event: eventName,
+      deliveryId,
+      processed: true,
+      ref: pushedRef,
+      headCommit: payload?.after || null,
+    });
+  }
+
+  await env.APP_KV.put(deliveryKey, '1', { expirationTtl: WEBHOOK_DELIVERY_TTL_SECONDS });
+
+  return json({ ok: true, event: eventName, deliveryId, processed: false, reason: 'event not handled' });
+}
+
 // ── Main Router ───────────────────────────────────────────────────────────────
 
 export default {
@@ -542,6 +841,10 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/login") {
       return handleLogin(request, env);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/webhooks/github') {
+      return handleGithubWebhook(request, env);
     }
 
     if (request.method === "GET" && url.pathname === "/projects") {
@@ -566,6 +869,14 @@ export default {
 
     if (request.method === 'POST' && url.pathname === '/canvas-state') {
       return handleSaveCanvasState(request, env);
+    }
+
+    if (request.method === 'GET' && url.pathname === '/presence') {
+      return handleGetEditorPresence(request, env);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/presence') {
+      return handleSaveEditorPresence(request, env);
     }
 
     return err("Not found", 404);

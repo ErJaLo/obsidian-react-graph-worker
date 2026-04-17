@@ -6,3 +6,6 @@ compatibility_date = "2024-01-01"
 binding = "APP_KV"
 id = "19d4e621b7af4b3c8709824b6b95931f"
 preview_id = "37356e1c04b9467b8a25c8e6a42cd7f1"
+
+[vars]
+ENABLE_GITHUB_WEBHOOKS = "false"

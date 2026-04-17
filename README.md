@@ -13,6 +13,9 @@ React App (Cloudflare Pages)
     │  GET  /projects
     │  GET  /projects/:campaignId/auth/:token/*
     │  POST /save
+    │  GET  /presence?campaignId=...
+    │  POST /presence
+  │  POST /webhooks/github
     ▼
 Cloudflare Worker  ◄──── KV (passwords, ACL, sessions)
     │
@@ -112,6 +115,57 @@ Authorization: Bearer <token>
 { "error": "Write access denied" }
 ```
 
+### `GET /presence?campaignId=...`
+Returns currently active editors for a campaign (heartbeat-based, short TTL) plus graph version metadata for lightweight client refresh decisions.
+
+```json
+// Response (200)
+{
+  "activeEditors": ["alice", "bob"],
+  "graphUpdatedAt": 1713373200000,
+  "graphUpdatedBy": "alice",
+  "graphCommit": "<commit_sha>"
+}
+```
+
+### `POST /presence`
+Heartbeat endpoint to mark current user as actively editing a campaign.
+
+```json
+// Request body
+{ "campaignId": "ravenfall-campaign" }
+
+// Response (200)
+{
+  "ok": true,
+  "campaignId": "ravenfall-campaign",
+  "username": "alice",
+  "activeEditors": ["alice", "bob"],
+  "graphUpdatedAt": 1713373200000,
+  "graphUpdatedBy": "alice",
+  "graphCommit": "<commit_sha>"
+}
+```
+
+### `POST /webhooks/github`
+GitHub webhook endpoint with signature verification (`X-Hub-Signature-256`).
+
+- Controlled by `ENABLE_GITHUB_WEBHOOKS`.
+- Requires `GITHUB_WEBHOOK_SECRET`.
+- Supports `ping` and `push` events (other events return `processed: false`).
+- Deduplicates deliveries using `X-GitHub-Delivery` in KV (24h TTL).
+
+```json
+// Response (200)
+{ "ok": true, "event": "push", "processed": true }
+
+// Response (401)
+{ "error": "Invalid webhook signature" }
+
+// Response (403) when disabled
+{ "error": "GitHub webhooks are disabled" }
+```
+
 ---
 
 ## Environment Variables & Secrets
@@ -124,6 +178,8 @@ Set these in Cloudflare Worker settings or with Wrangler:
 | `GITHUB_OWNER`  | Var    | GitHub user or org, e.g. `ErJaLo`          |
 | `GITHUB_REPO`   | Var    | Repo name, e.g. `Roleplay-Library`         |
 | `GITHUB_BRANCH` | Var    | Target branch, e.g. `main`                 |
+| `ENABLE_GITHUB_WEBHOOKS` | Var | Enable webhook endpoint (`true`/`1` to enable, default disabled) |
+| `GITHUB_WEBHOOK_SECRET` | Secret | Shared secret used to validate GitHub webhook signatures |
 
 `GRAPHS_PATH` is no longer used in the current flow.
 
@@ -201,6 +257,13 @@ Set these variables in Cloudflare Worker settings or via Wrangler environment co
 - `GITHUB_OWNER`
 - `GITHUB_REPO`
 - `GITHUB_BRANCH`
+- `ENABLE_GITHUB_WEBHOOKS=true` (optional, required only if you want webhooks enabled)
+
+Set webhook secret:
+
+```bash
+wrangler secret put GITHUB_WEBHOOK_SECRET
+```
 
 ### 5. Deploy
 
@@ -238,4 +301,5 @@ wrangler kv key put --remote --preview false --binding=APP_KV "acl" '<updated_js
 - The front end receives Worker URLs for campaign files and images, not GitHub raw URLs.
 - All GitHub writes include the acting username in the commit message: `Update ravenfall-campaign (by alice)`.
 - The GitHub Contents API requires the current file sha on updates — the Worker fetches it before each write.
+- Successful saves also update per-campaign graph version metadata in KV (`updatedAt`, `updatedBy`, `commit`) used by presence responses.
 - Sessions are stored in KV with an expiry timestamp. Expired tokens are rejected on each request.
